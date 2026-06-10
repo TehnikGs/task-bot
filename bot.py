@@ -14,6 +14,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -78,7 +81,11 @@ bot = Bot(
     session=_build_session(),
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
+
+
+class Comment(StatesGroup):
+    waiting = State()
 
 
 # ---------- вспомогательные ----------
@@ -92,17 +99,20 @@ def card_text(task: dict) -> str:
 
 def card_kb(task: dict):
     s = task["status"]
+    rows = []
     if s == db.STATUS_NEW:
-        rows = [[
+        rows.append([
             InlineKeyboardButton(text="✅ Принять", callback_data=f"accept:{task['id']}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{task['id']}"),
-        ]]
+        ])
     elif s == db.STATUS_IN_PROGRESS:
-        rows = [[InlineKeyboardButton(text="🏁 Завершить", callback_data=f"done:{task['id']}")]]
+        rows.append([InlineKeyboardButton(text="🏁 Завершить", callback_data=f"done:{task['id']}")])
     elif s == db.STATUS_DONE:
-        rows = [[InlineKeyboardButton(text="↩️ Вернуть в работу", callback_data=f"reopen:{task['id']}")]]
-    else:
-        rows = []
+        rows.append([InlineKeyboardButton(text="↩️ Вернуть в работу", callback_data=f"reopen:{task['id']}")])
+    if s != db.STATUS_REJECTED:
+        rows.append([InlineKeyboardButton(
+            text="💬 Комментарий/вопрос", callback_data=f"comment:{task['id']}"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
@@ -158,6 +168,26 @@ async def cmd_reset(message: Message):
     deleted = await delete_all_cards()
     n = db.clear_tasks()
     await message.answer(f"🧹 Сброшено задач: {n}. Карточек удалено из чатов: {deleted}.")
+
+
+# ---------- комментарий/вопрос по задаче ----------
+@dp.message(Comment.waiting, F.text)
+async def on_comment_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    task_id = data.get("task_id")
+    group_chat = data.get("group_chat") or message.chat.id
+    name = message.from_user.full_name
+    comment = message.text
+    # убрать «сырое» сообщение пользователя (бот — админ); не критично, если не выйдет
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await bot.send_message(
+        group_chat,
+        f"💬 <b>Комментарий к задаче #{task_id}</b> от {name}:\n{comment}",
+    )
 
 
 # ---------- голос и текст от начальника ----------
@@ -286,12 +316,40 @@ async def on_action(cb: CallbackQuery):
     db.set_status(task_id, new_status)
     task = db.get_task(task_id)
     await cb.message.edit_text(card_text(task), reply_markup=card_kb(task))
+    # оповещение в группе о действии исполнителя
+    notif = {
+        "accept": f"✅ {cb.from_user.full_name} принял(а) задачу #{task_id} в работу",
+        "done": f"🏁 {cb.from_user.full_name} завершил(а) задачу #{task_id}",
+        "reject": f"🚫 {cb.from_user.full_name} отклонил(а) задачу #{task_id}",
+        "reopen": f"↩️ {cb.from_user.full_name} вернул(а) задачу #{task_id} в работу",
+    }[action]
+    try:
+        await bot.send_message(task.get("chat_id") or cb.message.chat.id, notif)
+    except Exception:
+        log.exception("notif send failed")
     await cb.answer({
         "accept": "Принято в работу ✅",
         "reject": "Отклонено 🚫",
         "done": "Завершено 🏁",
         "reopen": "Возвращено в работу ↩️",
     }[action])
+
+
+@dp.callback_query(F.data.startswith("comment:"))
+async def on_comment_btn(cb: CallbackQuery, state: FSMContext):
+    task_id = int(cb.data.split(":", 1)[1])
+    task = db.get_task(task_id)
+    if not task:
+        await cb.answer("Задача не найдена.", show_alert=True)
+        return
+    await state.set_state(Comment.waiting)
+    await state.update_data(
+        task_id=task_id, group_chat=task.get("chat_id") or cb.message.chat.id
+    )
+    await cb.message.answer(
+        f"💬 Напишите комментарий или вопрос по задаче #{task_id} следующим сообщением."
+    )
+    await cb.answer()
 
 
 # ---------- HTTP API для программы начальника ----------
