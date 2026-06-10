@@ -95,3 +95,16 @@ def list_active():
             "SELECT * FROM tasks WHERE status!=? ORDER BY id", (STATUS_REJECTED,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def all_tasks():
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_tasks():
+    """Удалить все задачи. Возвращает число удалённых."""
+    with _conn() as con:
+        cur = con.execute("DELETE FROM tasks")
+        return cur.rowcount

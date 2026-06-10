@@ -39,6 +39,12 @@ TELEGRAM_PROXY = (os.getenv("TELEGRAM_PROXY") or "").strip()
 # Прокси для запросов к Groq (распознавание + понимание). Если пусто — берём тот же, что для Telegram.
 LLM_PROXY = (os.getenv("LLM_PROXY") or "").strip() or TELEGRAM_PROXY
 
+# --- HTTP API (для внешней программы начальника) ---
+# Если API_KEY пуст — API не запускается. Запросы требуют заголовок X-API-Key.
+API_KEY = (os.getenv("API_KEY") or "").strip()
+API_HOST = (os.getenv("API_HOST") or "0.0.0.0").strip()
+API_PORT = _int("API_PORT", 8081)
+
 # --- Прочее ---
 DB_PATH = (os.getenv("DB_PATH") or "tasks.db").strip()
 DEBUG = (os.getenv("DEBUG") or "").strip().lower() in ("1", "true", "yes")

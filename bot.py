@@ -20,6 +20,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from aiohttp import web
 
 import config
 import db
@@ -114,6 +115,15 @@ def is_employee(uid: int) -> bool:
     return config.EMPLOYEE_ID == 0 or uid in (config.EMPLOYEE_ID, config.BOSS_ID)
 
 
+def _targets(message: Message):
+    """Куда отправлять ответ. Если пишут в личке — дублируем и в группу."""
+    origin = message.chat.id
+    chats = [origin]
+    if config.GROUP_ID and config.GROUP_ID != origin:
+        chats.append(config.GROUP_ID)
+    return chats
+
+
 # ---------- служебные команды ----------
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -136,7 +146,18 @@ async def cmd_id(message: Message):
 
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: Message):
-    await send_list(message, db.list_active(), "📋 Все задачи")
+    await send_list([message.chat.id], db.list_active(), "📋 Все задачи")
+
+
+@dp.message(Command("reset"))
+async def cmd_reset(message: Message):
+    # Сброс всех задач. Только из личного чата (защита от случайного сброса в группе).
+    if message.chat.type != "private":
+        await message.answer("Команду /reset можно выполнить только в личке с ботом.")
+        return
+    deleted = await delete_all_cards()
+    n = db.clear_tasks()
+    await message.answer(f"🧹 Сброшено задач: {n}. Карточек удалено из чатов: {deleted}.")
 
 
 # ---------- голос и текст от начальника ----------
@@ -180,23 +201,26 @@ async def handle_command(message: Message, text: str):
 
     if intent == "create_task":
         task_text = result["task_text"] or text
-        # Куда класть карточку: если задана группа (GROUP_ID) — туда,
+        # Карточка с кнопками — в группу (там её принимает сотрудник),
         # иначе в тот же чат, где прозвучала команда.
         target_chat = config.GROUP_ID or message.chat.id
         task_id = db.add_task(task_text, target_chat)
         task = db.get_task(task_id)
         sent = await bot.send_message(target_chat, card_text(task), reply_markup=card_kb(task))
         db.set_card(task_id, sent.message_id)
+        # если команда из лички — продублировать подтверждение начальнику в личку
         if target_chat != message.chat.id:
-            await message.answer(f"✅ Задача #{task_id} отправлена в группу.")
+            await message.answer(
+                f"✅ Задача #{task_id} создана и отправлена в группу:\n«{task_text}»"
+            )
     elif intent == "list_in_progress":
-        await send_list(message, db.list_by_status(db.STATUS_IN_PROGRESS), "🔧 В работе")
+        await send_list(_targets(message), db.list_by_status(db.STATUS_IN_PROGRESS), "🔧 В работе")
     elif intent == "list_done":
-        await send_list(message, db.list_by_status(db.STATUS_DONE), "✅ Завершённые")
+        await send_list(_targets(message), db.list_by_status(db.STATUS_DONE), "✅ Завершённые")
     elif intent == "list_new":
-        await send_list(message, db.list_by_status(db.STATUS_NEW), "🆕 Не приняты")
+        await send_list(_targets(message), db.list_by_status(db.STATUS_NEW), "🆕 Не приняты")
     elif intent == "list_all":
-        await send_list(message, db.list_active(), "📋 Все задачи")
+        await send_list(_targets(message), db.list_active(), "📋 Все задачи")
     else:
         await message.answer(
             "🤔 Не понял команду. Например, можно так:\n"
@@ -207,14 +231,32 @@ async def handle_command(message: Message, text: str):
         )
 
 
-async def send_list(message: Message, tasks, title: str):
-    if not tasks:
-        await message.answer(f"<b>{title}</b>\n\nПусто.")
-        return
-    lines = [f"<b>{title}</b>\n"]
-    for t in tasks:
-        lines.append(f"#{t['id']} {STATUS_LABEL.get(t['status'], '')} — {t['text']}")
-    await message.answer("\n".join(lines))
+async def send_list(chat_ids, tasks, title: str):
+    if tasks:
+        lines = [f"<b>{title}</b>\n"]
+        for t in tasks:
+            lines.append(f"#{t['id']} {STATUS_LABEL.get(t['status'], '')} — {t['text']}")
+        text = "\n".join(lines)
+    else:
+        text = f"<b>{title}</b>\n\nПусто."
+    for cid in chat_ids:
+        try:
+            await bot.send_message(cid, text)
+        except Exception:
+            log.exception("send_list -> %s failed", cid)
+
+
+async def delete_all_cards() -> int:
+    """Удалить из чатов карточки всех задач (по возможности). Возвращает число удалённых."""
+    count = 0
+    for t in db.all_tasks():
+        if t.get("chat_id") and t.get("message_id"):
+            try:
+                await bot.delete_message(t["chat_id"], t["message_id"])
+                count += 1
+            except Exception:
+                pass
+    return count
 
 
 # ---------- кнопки сотрудника ----------
@@ -247,10 +289,127 @@ async def on_action(cb: CallbackQuery):
     }[action])
 
 
+# ---------- HTTP API для программы начальника ----------
+def _api_authorized(request) -> bool:
+    return bool(config.API_KEY) and request.headers.get("X-API-Key") == config.API_KEY
+
+
+def _task_json(t: dict) -> dict:
+    return {
+        "id": t["id"],
+        "text": t["text"],
+        "status": t["status"],
+        "status_label": STATUS_LABEL.get(t["status"], t["status"]),
+        "created_at": t["created_at"],
+        "accepted_at": t["accepted_at"],
+        "done_at": t["done_at"],
+    }
+
+
+@web.middleware
+async def _auth_mw(request, handler):
+    if request.path == "/api/health":
+        return await handler(request)
+    if not _api_authorized(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    return await handler(request)
+
+
+async def api_health(request):
+    return web.json_response({"ok": True})
+
+
+async def api_list(request):
+    status = request.query.get("status")
+    tasks = db.list_by_status(status) if status else db.list_active()
+    return web.json_response({"tasks": [_task_json(t) for t in tasks]})
+
+
+async def api_get(request):
+    t = db.get_task(int(request.match_info["id"]))
+    if not t:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response(_task_json(t))
+
+
+async def api_create(request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return web.json_response({"error": "field 'text' required"}, status=400)
+    target = config.GROUP_ID or 0
+    task_id = db.add_task(text, target)
+    task = db.get_task(task_id)
+    if target:
+        try:
+            sent = await bot.send_message(target, card_text(task), reply_markup=card_kb(task))
+            db.set_card(task_id, sent.message_id)
+            task = db.get_task(task_id)
+        except Exception:
+            log.exception("api_create: не удалось отправить карточку в группу")
+    return web.json_response(_task_json(task), status=201)
+
+
+async def api_set_status(request):
+    t = db.get_task(int(request.match_info["id"]))
+    if not t:
+        return web.json_response({"error": "not found"}, status=404)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    status = (data.get("status") or "").strip()
+    valid = (db.STATUS_NEW, db.STATUS_IN_PROGRESS, db.STATUS_DONE, db.STATUS_REJECTED)
+    if status not in valid:
+        return web.json_response({"error": f"status must be one of {valid}"}, status=400)
+    db.set_status(t["id"], status)
+    t = db.get_task(t["id"])
+    if t.get("chat_id") and t.get("message_id"):
+        try:
+            await bot.edit_message_text(
+                card_text(t), chat_id=t["chat_id"], message_id=t["message_id"],
+                reply_markup=card_kb(t),
+            )
+        except Exception:
+            pass
+    return web.json_response(_task_json(t))
+
+
+async def api_reset(request):
+    deleted = await delete_all_cards()
+    n = db.clear_tasks()
+    return web.json_response({"reset": True, "removed_tasks": n, "deleted_cards": deleted})
+
+
+async def start_api():
+    app = web.Application(middlewares=[_auth_mw])
+    app.add_routes([
+        web.get("/api/health", api_health),
+        web.get("/api/tasks", api_list),
+        web.get("/api/tasks/{id}", api_get),
+        web.post("/api/tasks", api_create),
+        web.post("/api/tasks/{id}/status", api_set_status),
+        web.post("/api/reset", api_reset),
+    ])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, config.API_HOST, config.API_PORT)
+    await site.start()
+    log.info("HTTP API слушает %s:%s", config.API_HOST, config.API_PORT)
+    return runner
+
+
 async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан. Заполни .env (см. .env.example).")
     db.init_db()
+    if config.API_KEY:
+        await start_api()
+    else:
+        log.info("HTTP API выключен (API_KEY не задан)")
     log.info(
         "Бот запущен. STT=%s, понимание=%s",
         config.STT_BACKEND,
