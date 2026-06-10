@@ -7,6 +7,7 @@ import asyncio
 import logging
 import os
 import tempfile
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -35,11 +36,45 @@ STATUS_LABEL = {
     db.STATUS_REJECTED: "🚫 Отклонена",
 }
 
-# Если задан прокси для Telegram (сервер в РФ) — гоним запросы к api.telegram.org через него.
-_session = AiohttpSession(proxy=config.TELEGRAM_PROXY) if config.TELEGRAM_PROXY else None
+class _Socks5RdnsSession(AiohttpSession):
+    """SOCKS5-сессия с удалённым разрешением имён (rdns=True).
+
+    Нужна для серверов в РФ: api.telegram.org там заблокирован/отравлен в DNS,
+    поэтому имя должно разрешаться на стороне прокси, а не локально на сервере.
+    """
+
+    def __init__(self, host, port, username, password, **kwargs):
+        super().__init__(**kwargs)
+        from aiohttp_socks import ProxyConnector, ProxyType
+
+        self._connector_type = ProxyConnector
+        self._connector_init = dict(
+            proxy_type=ProxyType.SOCKS5,
+            host=host,
+            port=int(port),
+            username=username,
+            password=password,
+            rdns=True,
+        )
+
+
+def _build_session():
+    """Сессия для Telegram. Для SOCKS5 включаем удалённый DNS (обход блокировки в РФ)."""
+    proxy = config.TELEGRAM_PROXY
+    if not proxy:
+        return None
+    parsed = urlparse(proxy)
+    if parsed.scheme.lower().startswith("socks5"):
+        return _Socks5RdnsSession(
+            parsed.hostname, parsed.port, parsed.username, parsed.password
+        )
+    # http/https-прокси — стандартный путь aiogram
+    return AiohttpSession(proxy=proxy)
+
+
 bot = Bot(
     config.BOT_TOKEN,
-    session=_session,
+    session=_build_session(),
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
