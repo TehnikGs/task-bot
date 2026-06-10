@@ -1,0 +1,15 @@
+[Unit]
+Description=Task Bot (Telegram voice task manager)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/myapp/task-bot
+EnvironmentFile=/root/myapp/task-bot/.env
+ExecStart=/root/myapp/task-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
