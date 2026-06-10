@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/myapp/task-bot
-EnvironmentFile=/root/myapp/task-bot/.env
+EnvironmentFile=-/root/myapp/task-bot/.env
 ExecStart=/root/myapp/task-bot/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
