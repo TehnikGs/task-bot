@@ -69,7 +69,7 @@ async def parse_intent(text: str) -> dict:
     if not config.LLM_API_KEY:
         return _heuristic(text)
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, proxy=config.LLM_PROXY or None) as client:
             resp = await client.post(
                 f"{config.LLM_BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},

@@ -33,6 +33,12 @@ STT_BASE_URL = (os.getenv("STT_BASE_URL") or "https://api.groq.com/openai/v1").s
 STT_MODEL = (os.getenv("STT_MODEL") or "whisper-large-v3").strip()
 STT_LOCAL_MODEL = (os.getenv("STT_LOCAL_MODEL") or "small").strip()  # для faster-whisper
 
+# --- Прокси (для сервера в РФ, если Telegram/Groq заблокированы) ---
+# Примеры: socks5://user:pass@1.2.3.4:1080  или  http://1.2.3.4:3128
+TELEGRAM_PROXY = (os.getenv("TELEGRAM_PROXY") or "").strip()
+# Прокси для запросов к Groq (распознавание + понимание). Если пусто — берём тот же, что для Telegram.
+LLM_PROXY = (os.getenv("LLM_PROXY") or "").strip() or TELEGRAM_PROXY
+
 # --- Прочее ---
 DB_PATH = (os.getenv("DB_PATH") or "tasks.db").strip()
 DEBUG = (os.getenv("DEBUG") or "").strip().lower() in ("1", "true", "yes")

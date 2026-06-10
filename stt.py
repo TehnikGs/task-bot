@@ -24,7 +24,7 @@ async def _transcribe_groq(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
         files = {"file": (audio_path, f, "audio/ogg")}
         data = {"model": config.STT_MODEL, "language": "ru"}
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, proxy=config.LLM_PROXY or None) as client:
             resp = await client.post(
                 f"{config.STT_BASE_URL}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {config.STT_API_KEY}"},

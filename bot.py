@@ -10,6 +10,7 @@ import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -34,7 +35,13 @@ STATUS_LABEL = {
     db.STATUS_REJECTED: "🚫 Отклонена",
 }
 
-bot = Bot(config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# Если задан прокси для Telegram (сервер в РФ) — гоним запросы к api.telegram.org через него.
+_session = AiohttpSession(proxy=config.TELEGRAM_PROXY) if config.TELEGRAM_PROXY else None
+bot = Bot(
+    config.BOT_TOKEN,
+    session=_session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 
