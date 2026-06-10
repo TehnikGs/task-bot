@@ -189,7 +189,10 @@ async def on_voice(message: Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
-    # текст работает так же, как голос — удобно для тестов без микрофона
+    # В группе НЕ реагируем на обычный текст (иначе бот отвечает на любую переписку
+    # и может случайно создать задачу). Текстовые команды — только в личке.
+    if message.chat.type != "private":
+        return
     if not is_boss(message.from_user.id):
         return
     await handle_command(message, message.text)
@@ -222,13 +225,15 @@ async def handle_command(message: Message, text: str):
     elif intent == "list_all":
         await send_list(_targets(message), db.list_active(), "📋 Все задачи")
     else:
-        await message.answer(
-            "🤔 Не понял команду. Например, можно так:\n"
-            "• «Поставь задачу убрать цех к вечеру»\n"
-            "• «Что сейчас в работе?»\n"
-            "• «Какие задачи завершены?»\n"
-            "• «Что ещё не принято?»"
-        )
+        # «Не понял» отвечаем только в личке — в группе молчим, чтобы не спамить.
+        if message.chat.type == "private":
+            await message.answer(
+                "🤔 Не понял команду. Например, можно так:\n"
+                "• «Поставь задачу убрать цех к вечеру»\n"
+                "• «Что сейчас в работе?»\n"
+                "• «Какие задачи завершены?»\n"
+                "• «Что ещё не принято?»"
+            )
 
 
 async def send_list(chat_ids, tasks, title: str):
