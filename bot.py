@@ -217,22 +217,15 @@ async def on_voice(message: Message):
     await handle_command(message, text)
 
 
-# В группе разбираем текст, только если фраза похожа на команду (есть ключевики).
-# Так бот отвечает на «Покажи задачи», но молчит на обычную переписку и не гоняет ИИ зря.
-_GROUP_HINTS = (
-    "задач", "работ", "заверш", "выполн", "готов", "принят",
-    "сделай", "сделал", "покажи", "список", "статус", "надо", "нужно", "поручаю",
-)
-
-
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message):
     if not is_boss(message.from_user.id):
         return
     if message.chat.type != "private":
-        low = message.text.lower()
-        if not any(h in low for h in _GROUP_HINTS):
-            return  # обычная переписка в группе — не трогаем
+        # В группе пропускаем совсем короткие реплики («да», «ок», «понял»),
+        # остальное отдаём ИИ — он сам отличит поручение от обсуждения.
+        if len(message.text.split()) < 2:
+            return
     await handle_command(message, message.text)
 
 
