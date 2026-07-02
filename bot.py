@@ -4,6 +4,7 @@
 Сотрудник кнопками принимает / завершает задачи.
 """
 import asyncio
+import html
 import logging
 import os
 import tempfile
@@ -89,10 +90,15 @@ class Comment(StatesGroup):
 
 
 # ---------- вспомогательные ----------
+def esc(s) -> str:
+    """Экранировать текст для HTML-разметки Telegram."""
+    return html.escape(str(s), quote=False)
+
+
 def card_text(task: dict) -> str:
     return (
         f"📋 <b>Задача #{task['id']}</b>\n"
-        f"«{task['text']}»\n\n"
+        f"<blockquote>{esc(task['text'])}</blockquote>\n"
         f"Статус: {STATUS_LABEL.get(task['status'], task['status'])}"
     )
 
@@ -156,7 +162,7 @@ async def cmd_id(message: Message):
 
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: Message):
-    await send_list([message.chat.id], db.list_active(), "📋 Все задачи")
+    await send_to([message.chat.id], format_all_tasks())
 
 
 @dp.message(Command("reset"))
@@ -186,7 +192,8 @@ async def on_comment_text(message: Message, state: FSMContext):
         pass
     await bot.send_message(
         group_chat,
-        f"💬 <b>Комментарий к задаче #{task_id}</b> от {name}:\n{comment}",
+        f"💬 <b>Комментарий к задаче #{task_id}</b> от {esc(name)}:\n"
+        f"<blockquote>{esc(comment)}</blockquote>",
     )
 
 
@@ -213,7 +220,7 @@ async def on_voice(message: Message):
     if not text:
         await note.edit_text("🤷 Ничего не расслышал, повтори, пожалуйста.")
         return
-    await note.edit_text(f"📝 «{text}»")
+    await note.edit_text(f"📝 «{esc(text)}»")
     await handle_command(message, text)
 
 
@@ -245,16 +252,17 @@ async def handle_command(message: Message, text: str):
         # если команда из лички — продублировать подтверждение начальнику в личку
         if target_chat != message.chat.id:
             await message.answer(
-                f"✅ Задача #{task_id} создана и отправлена в группу:\n«{task_text}»"
+                f"✅ Задача #{task_id} создана и отправлена в группу:\n"
+                f"<blockquote>{esc(task_text)}</blockquote>"
             )
     elif intent == "list_in_progress":
-        await send_list(_targets(message), db.list_by_status(db.STATUS_IN_PROGRESS), "🔧 В работе")
+        await send_to(_targets(message), _fmt_group("🔧 В работе", db.list_by_status(db.STATUS_IN_PROGRESS)))
     elif intent == "list_done":
-        await send_list(_targets(message), db.list_by_status(db.STATUS_DONE), "✅ Завершённые")
+        await send_to(_targets(message), _fmt_group("✅ Завершённые", db.list_by_status(db.STATUS_DONE)))
     elif intent == "list_new":
-        await send_list(_targets(message), db.list_by_status(db.STATUS_NEW), "🆕 Не приняты")
+        await send_to(_targets(message), _fmt_group("🆕 Не принятые", db.list_by_status(db.STATUS_NEW)))
     elif intent == "list_all":
-        await send_list(_targets(message), db.list_active(), "📋 Все задачи")
+        await send_to(_targets(message), format_all_tasks())
     else:
         # «Не понял» отвечаем только в личке — в группе молчим, чтобы не спамить.
         if message.chat.type == "private":
@@ -267,19 +275,32 @@ async def handle_command(message: Message, text: str):
             )
 
 
-async def send_list(chat_ids, tasks, title: str):
+def _fmt_group(title: str, tasks) -> str:
+    """Заголовок жирным + раскрывающийся список задач (можно свернуть/развернуть)."""
     if tasks:
-        lines = [f"<b>{title}</b>\n"]
-        for t in tasks:
-            lines.append(f"#{t['id']} {STATUS_LABEL.get(t['status'], '')} — {t['text']}")
-        text = "\n".join(lines)
-    else:
-        text = f"<b>{title}</b>\n\nПусто."
+        body = "\n".join(f"#{t['id']} — {esc(t['text'])}" for t in tasks)
+        return f"<b>{title} — {len(tasks)}</b>\n<blockquote expandable>{body}</blockquote>"
+    return f"<b>{title} — 0</b>\n<i>пусто</i>"
+
+
+def format_all_tasks() -> str:
+    """Одно сообщение: В работе / Завершённые / Не принятые — каждая секция раскрывается."""
+    return (
+        "📋 <b>Задачи</b>\n\n"
+        + _fmt_group("🔧 В работе", db.list_by_status(db.STATUS_IN_PROGRESS))
+        + "\n\n"
+        + _fmt_group("✅ Завершённые", db.list_by_status(db.STATUS_DONE))
+        + "\n\n"
+        + _fmt_group("🆕 Не принятые", db.list_by_status(db.STATUS_NEW))
+    )
+
+
+async def send_to(chat_ids, text: str):
     for cid in chat_ids:
         try:
             await bot.send_message(cid, text)
         except Exception:
-            log.exception("send_list -> %s failed", cid)
+            log.exception("send_to -> %s failed", cid)
 
 
 async def delete_all_cards() -> int:
@@ -318,11 +339,12 @@ async def on_action(cb: CallbackQuery):
     task = db.get_task(task_id)
     await cb.message.edit_text(card_text(task), reply_markup=card_kb(task))
     # оповещение в группе о действии исполнителя
+    who = esc(cb.from_user.full_name)
     notif = {
-        "accept": f"✅ {cb.from_user.full_name} принял(а) задачу #{task_id} в работу",
-        "done": f"🏁 {cb.from_user.full_name} завершил(а) задачу #{task_id}",
-        "reject": f"🚫 {cb.from_user.full_name} отклонил(а) задачу #{task_id}",
-        "reopen": f"↩️ {cb.from_user.full_name} вернул(а) задачу #{task_id} в работу",
+        "accept": f"✅ <b>{who}</b> принял(а) задачу #{task_id} в работу",
+        "done": f"🏁 <b>{who}</b> завершил(а) задачу #{task_id}",
+        "reject": f"🚫 <b>{who}</b> отклонил(а) задачу #{task_id}",
+        "reopen": f"↩️ <b>{who}</b> вернул(а) задачу #{task_id} в работу",
     }[action]
     try:
         await bot.send_message(task.get("chat_id") or cb.message.chat.id, notif)
