@@ -4,6 +4,7 @@
 Сотрудник кнопками принимает / завершает задачи.
 """
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -14,6 +15,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,8 +25,9 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    Update,
 )
-from aiohttp import web
+from aiohttp import ClientError, web
 
 import config
 import db
@@ -63,8 +66,47 @@ class _Socks5RdnsSession(AiohttpSession):
         )
 
 
+class RelaySession(AiohttpSession):
+    """Все запросы к Telegram идут через Google Apps Script relay (бесплатная замена прокси).
+
+    Сервер в РФ шлёт POST на RELAY_URL: {secret, method, params}; Google дергает
+    метод Telegram и возвращает ответ. Так исходящие запросы не идут напрямую в Telegram.
+    """
+
+    async def make_request(self, bot, method, timeout=None):
+        session = await self.create_session()
+        files: dict = {}
+        params: dict = {}
+        for key, value in method.model_dump(warnings=False).items():
+            prepared = self.prepare_value(value, bot=bot, files=files)
+            if not prepared:
+                continue
+            params[key] = prepared
+        payload = {
+            "secret": config.RELAY_SECRET,
+            "method": method.__api_method__,
+            "params": params,
+        }
+        try:
+            async with session.post(
+                config.RELAY_URL,
+                json=payload,
+                timeout=self.timeout if timeout is None else timeout,
+            ) as resp:
+                raw = await resp.text()
+                status = resp.status
+        except asyncio.TimeoutError as e:
+            raise TelegramNetworkError(method=method, message="Relay timeout") from e
+        except ClientError as e:
+            raise TelegramNetworkError(method=method, message=f"{type(e).__name__}: {e}") from e
+        response = self.check_response(bot=bot, method=method, status_code=status, content=raw)
+        return response.result
+
+
 def _build_session():
-    """Сессия для Telegram. Для SOCKS5 включаем удалённый DNS (обход блокировки в РФ)."""
+    """Сессия для Telegram. Приоритет: релей → SOCKS5-прокси → прямое соединение."""
+    if config.RELAY_URL:
+        return RelaySession()
     proxy = config.TELEGRAM_PROXY
     if not proxy:
         return None
@@ -75,6 +117,19 @@ def _build_session():
         )
     # http/https-прокси — стандартный путь aiogram
     return AiohttpSession(proxy=proxy)
+
+
+async def relay_download(file_path: str) -> bytes:
+    """Скачать файл (голосовое) через релей — сервер в РФ не достаёт file-сервер Telegram."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(
+            config.RELAY_URL,
+            json={"secret": config.RELAY_SECRET, "method": "downloadFile", "file_path": file_path},
+        )
+        r.raise_for_status()
+        return base64.b64decode(r.json()["base64"])
 
 
 bot = Bot(
@@ -207,7 +262,13 @@ async def on_voice(message: Message):
     try:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp_path = tmp.name
-        await bot.download(message.voice, destination=tmp_path)
+        if config.RELAY_URL:
+            # через релей: сперва узнаём file_path, потом качаем байты через Google
+            f_info = await bot.get_file(message.voice.file_id)
+            with open(tmp_path, "wb") as out:
+                out.write(await relay_download(f_info.file_path))
+        else:
+            await bot.download(message.voice, destination=tmp_path)
         text = await stt.transcribe(tmp_path)
     except Exception:
         log.exception("STT failed")
@@ -394,7 +455,8 @@ def _task_json(t: dict) -> dict:
 
 @web.middleware
 async def _auth_mw(request, handler):
-    if request.path == "/api/health":
+    # /webhook и /api/health не требуют X-API-Key (у /webhook своя проверка секрета)
+    if request.path in ("/api/health", "/webhook"):
         return await handler(request)
     if not _api_authorized(request):
         return web.json_response({"error": "unauthorized"}, status=401)
@@ -470,21 +532,56 @@ async def api_reset(request):
     return web.json_response({"reset": True, "removed_tasks": n, "deleted_cards": deleted})
 
 
-async def start_api():
+# ---------- приём апдейтов Telegram (вебхук через релей) ----------
+_seen_updates: set = set()
+
+
+async def webhook_handler(request):
+    """Апдейты Telegram, пересланные Google-релеем на /webhook."""
+    if config.WEBHOOK_SECRET and request.headers.get("X-Relay-Secret") != config.WEBHOOK_SECRET:
+        return web.Response(status=403)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400)
+    uid = data.get("update_id")
+    if uid is not None:
+        if uid in _seen_updates:
+            return web.Response()  # дубликат (Telegram мог повторить доставку)
+        _seen_updates.add(uid)
+        if len(_seen_updates) > 2000:
+            _seen_updates.clear()
+    try:
+        update = Update.model_validate(data, context={"bot": bot})
+    except Exception:
+        log.exception("Некорректный апдейт")
+        return web.Response()
+    asyncio.create_task(dp.feed_update(bot, update))
+    return web.Response()
+
+
+async def start_web():
+    """Веб-сервер: HTTP API (если задан ключ) и/или приём вебхука (если задан релей)."""
     app = web.Application(middlewares=[_auth_mw])
-    app.add_routes([
-        web.get("/api/health", api_health),
-        web.get("/api/tasks", api_list),
-        web.get("/api/tasks/{id}", api_get),
-        web.post("/api/tasks", api_create),
-        web.post("/api/tasks/{id}/status", api_set_status),
-        web.post("/api/reset", api_reset),
-    ])
+    if config.API_KEY:
+        app.add_routes([
+            web.get("/api/health", api_health),
+            web.get("/api/tasks", api_list),
+            web.get("/api/tasks/{id}", api_get),
+            web.post("/api/tasks", api_create),
+            web.post("/api/tasks/{id}/status", api_set_status),
+            web.post("/api/reset", api_reset),
+        ])
+    if config.RELAY_URL:
+        app.add_routes([web.post("/webhook", webhook_handler)])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, config.API_HOST, config.API_PORT)
     await site.start()
-    log.info("HTTP API слушает %s:%s", config.API_HOST, config.API_PORT)
+    log.info(
+        "Веб-сервер %s:%s (API=%s, webhook=%s)",
+        config.API_HOST, config.API_PORT, bool(config.API_KEY), bool(config.RELAY_URL),
+    )
     return runner
 
 
@@ -492,16 +589,25 @@ async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан. Заполни .env (см. .env.example).")
     db.init_db()
-    if config.API_KEY:
-        await start_api()
-    else:
-        log.info("HTTP API выключен (API_KEY не задан)")
+    await start_web()
     log.info(
-        "Бот запущен. STT=%s, понимание=%s",
+        "Бот запущен. Режим=%s, STT=%s, понимание=%s",
+        "релей+вебхук" if config.RELAY_URL else "опрос",
         config.STT_BACKEND,
         config.LLM_MODEL if config.LLM_API_KEY else "по правилам (без ключа)",
     )
-    await dp.start_polling(bot)
+    if config.RELAY_URL:
+        # Telegram шлёт апдейты на релей, релей — на наш /webhook. Опрос не нужен.
+        await bot.set_webhook(
+            config.RELAY_URL,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+        )
+        log.info("Webhook установлен на релей: %s", config.RELAY_URL)
+        await asyncio.Event().wait()
+    else:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot)
 
 
 if __name__ == "__main__":

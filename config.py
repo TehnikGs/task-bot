@@ -39,6 +39,12 @@ TELEGRAM_PROXY = (os.getenv("TELEGRAM_PROXY") or "").strip()
 # Прокси для запросов к Groq (распознавание + понимание). Если пусто — берём тот же, что для Telegram.
 LLM_PROXY = (os.getenv("LLM_PROXY") or "").strip() or TELEGRAM_PROXY
 
+# --- Google Apps Script relay (бесплатная замена прокси) ---
+# Если задан RELAY_URL — бот работает через релей + вебхук (без прокси и без опроса).
+RELAY_URL = (os.getenv("RELAY_URL") or "").strip()
+RELAY_SECRET = (os.getenv("RELAY_SECRET") or "").strip()
+WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+
 # --- HTTP API (для внешней программы начальника) ---
 # Если API_KEY пуст — API не запускается. Запросы требуют заголовок X-API-Key.
 API_KEY = (os.getenv("API_KEY") or "").strip()
