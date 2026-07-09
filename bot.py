@@ -592,21 +592,16 @@ async def main():
     await start_web()
     log.info(
         "Бот запущен. Режим=%s, STT=%s, понимание=%s",
-        "релей+вебхук" if config.RELAY_URL else "опрос",
+        "релей+опрос" if config.RELAY_URL else "опрос",
         config.STT_BACKEND,
         config.LLM_MODEL if config.LLM_API_KEY else "по правилам (без ключа)",
     )
+    # Убираем вебхук (в т.ч. возможный старый на релее) и опрашиваем Telegram.
+    await bot.delete_webhook(drop_pending_updates=False)
     if config.RELAY_URL:
-        # Telegram шлёт апдейты на релей, релей — на наш /webhook. Опрос не нужен.
-        await bot.set_webhook(
-            config.RELAY_URL,
-            allowed_updates=["message", "callback_query"],
-            drop_pending_updates=True,
-        )
-        log.info("Webhook установлен на релей: %s", config.RELAY_URL)
-        await asyncio.Event().wait()
+        # Опрос Telegram ЧЕРЕЗ релей (без вебхука — обходим 302-редирект Google).
+        await dp.start_polling(bot, polling_timeout=20)
     else:
-        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
 
 
