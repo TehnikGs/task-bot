@@ -1,6 +1,7 @@
 """Понимание смысла команды: расшифровка речи -> намерение + текст задачи.
 
 Если задан LLM_API_KEY — используем бесплатную модель (Groq Llama).
+Вызов Groq идёт через релей (если задан RELAY_URL) — обход гео-блокировки РФ.
 Если ключа нет / ИИ недоступен — работает запасной разбор по ключевым словам.
 """
 import json
@@ -43,8 +44,7 @@ SYSTEM_PROMPT = (
 
 
 def _heuristic(text: str) -> dict:
-    """Запасной разбор без ИИ. Создаёт задачу только при явном слове-триггере,
-    чтобы при сбое ИИ не превращать обычную переписку в задачи."""
+    """Запасной разбор без ИИ. Создаёт задачу только при явном слове-триггере."""
     t = text.lower()
     if any(k in t for k in ("в работе", "в работу", "что делаешь", "чем занят")):
         return {"intent": "list_in_progress", "task_text": ""}
@@ -55,7 +55,6 @@ def _heuristic(text: str) -> dict:
     if any(k in t for k in ("все задачи", "весь список", "общий статус", "список задач", "покажи задачи")):
         return {"intent": "list_all", "task_text": ""}
 
-    # создаём задачу только если есть явный триггер
     task = text
     matched = False
     for trig in ("поставь задачу", "поставить задачу", "новая задача", "поручаю",
@@ -71,34 +70,53 @@ def _heuristic(text: str) -> dict:
     return {"intent": "unknown", "task_text": ""}
 
 
+async def _chat(payload: dict) -> str:
+    """Вызов Groq chat: через релей (обход гео-блокировки) или напрямую."""
+    if config.RELAY_URL:
+        async with httpx.AsyncClient(timeout=40) as client:
+            r = await client.post(
+                config.RELAY_URL,
+                follow_redirects=True,
+                json={"secret": config.RELAY_SECRET, "method": "groqChat",
+                      "key": config.LLM_API_KEY, "payload": payload},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"relay groqChat status {data.get('status')}")
+            body = json.loads(data["body"])
+            return body["choices"][0]["message"]["content"]
+    async with httpx.AsyncClient(timeout=30, proxy=config.LLM_PROXY or None) as client:
+        resp = await client.post(
+            f"{config.LLM_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
 async def parse_intent(text: str) -> dict:
     text = (text or "").strip()
     if not text:
         return {"intent": "unknown", "task_text": ""}
     if not config.LLM_API_KEY:
         return _heuristic(text)
+    payload = {
+        "model": config.LLM_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+    }
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=config.LLM_PROXY or None) as client:
-            resp = await client.post(
-                f"{config.LLM_BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-                json={
-                    "model": config.LLM_MODEL,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": text},
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            data = json.loads(content)
-            intent = data.get("intent", "unknown")
-            if intent not in INTENTS:
-                intent = "unknown"
-            return {"intent": intent, "task_text": (data.get("task_text") or "").strip()}
+        content = await _chat(payload)
+        data = json.loads(content)
+        intent = data.get("intent", "unknown")
+        if intent not in INTENTS:
+            intent = "unknown"
+        return {"intent": intent, "task_text": (data.get("task_text") or "").strip()}
     except Exception:
-        # любая ошибка сети/модели -> не падаем, разбираем по правилам
         return _heuristic(text)

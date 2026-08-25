@@ -260,19 +260,18 @@ async def on_voice(message: Message):
     note = await message.answer("🎧 Слушаю…")
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp_path = tmp.name
         if config.RELAY_URL:
-            # через релей: сперва узнаём file_path, потом качаем байты через Google
+            # релей сам качает файл из Telegram и распознаёт через Groq (обход блокировок)
             f_info = await bot.get_file(message.voice.file_id)
-            with open(tmp_path, "wb") as out:
-                out.write(await relay_download(f_info.file_path))
+            text = await stt.transcribe_via_relay(f_info.file_path)
         else:
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp_path = tmp.name
             await bot.download(message.voice, destination=tmp_path)
-        text = await stt.transcribe(tmp_path)
+            text = await stt.transcribe(tmp_path)
     except Exception:
         log.exception("STT failed")
-        await note.edit_text("⚠️ Не удалось распознать голос. Проверь настройки распознавания (ключ/баланс).")
+        await note.edit_text("⚠️ Не удалось распознать голос.")
         return
     finally:
         if tmp_path and os.path.exists(tmp_path):
