@@ -24,7 +24,7 @@ GROUP_ID = _int("GROUP_ID")        # ID группы (пока не исполь
 #     https://console.groq.com/keys  ---
 LLM_API_KEY = (os.getenv("LLM_API_KEY") or "").strip()
 LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or "https://api.groq.com/openai/v1").strip().rstrip("/")
-LLM_MODEL = (os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile").strip()
+LLM_MODEL = (os.getenv("LLM_MODEL") or "openai/gpt-oss-20b").strip()
 
 # --- STT (распознавание речи). backend: groq | local ---
 STT_BACKEND = (os.getenv("STT_BACKEND") or "groq").strip().lower()
