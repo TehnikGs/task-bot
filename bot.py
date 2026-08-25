@@ -585,6 +585,25 @@ async def start_web():
     return runner
 
 
+async def relay_poll_loop():
+    """Короткий опрос Telegram через релей (timeout=0) с паузой между запросами.
+
+    Длинный long-poll через Google Apps Script нестабилен (Relay timeout),
+    а короткий возвращается мгновенно и работает надёжно.
+    """
+    log.info("Опрос через релей: короткий, пауза ~%sс", config.POLL_INTERVAL)
+    offset = None
+    while True:
+        try:
+            updates = await bot.get_updates(offset=offset, timeout=0)
+            for u in updates:
+                offset = u.update_id + 1
+                asyncio.create_task(dp.feed_update(bot, u))
+        except Exception as e:
+            log.warning("Ошибка опроса: %s: %s", type(e).__name__, str(e)[:120])
+        await asyncio.sleep(config.POLL_INTERVAL)
+
+
 async def main():
     if not config.BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан. Заполни .env (см. .env.example).")
@@ -596,12 +615,12 @@ async def main():
         config.STT_BACKEND,
         config.LLM_MODEL if config.LLM_API_KEY else "по правилам (без ключа)",
     )
-    # Убираем вебхук (в т.ч. возможный старый на релее) и опрашиваем Telegram.
-    await bot.delete_webhook(drop_pending_updates=False)
     if config.RELAY_URL:
-        # Опрос Telegram ЧЕРЕЗ релей (без вебхука — обходим 302-редирект Google).
-        await dp.start_polling(bot, polling_timeout=20)
+        # Чистим backlog и опрашиваем коротким опросом через релей.
+        await bot.delete_webhook(drop_pending_updates=True)
+        await relay_poll_loop()
     else:
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
 
 

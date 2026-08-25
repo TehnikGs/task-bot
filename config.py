@@ -44,6 +44,9 @@ LLM_PROXY = (os.getenv("LLM_PROXY") or "").strip() or TELEGRAM_PROXY
 RELAY_URL = (os.getenv("RELAY_URL") or "").strip()
 RELAY_SECRET = (os.getenv("RELAY_SECRET") or "").strip()
 WEBHOOK_SECRET = (os.getenv("WEBHOOK_SECRET") or "").strip()
+# Пауза между короткими опросами Telegram через релей (сек). Меньше = быстрее ответ,
+# но больше запросов к Google (суточный лимит ~20000).
+POLL_INTERVAL = _int("POLL_INTERVAL", 5)
 
 # --- HTTP API (для внешней программы начальника) ---
 # Если API_KEY пуст — API не запускается. Запросы требуют заголовок X-API-Key.
