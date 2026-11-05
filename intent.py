@@ -5,6 +5,7 @@
 Если ключа нет / ИИ недоступен — работает запасной разбор по ключевым словам.
 """
 import json
+import re
 
 import httpx
 
@@ -96,10 +97,21 @@ async def _chat(payload: dict) -> str:
         return resp.json()["choices"][0]["message"]["content"]
 
 
+# Явная команда: сообщение НАЧИНАЕТСЯ с этих слов → это всегда задача (без ИИ).
+_EXPLICIT_TASK = re.compile(
+    r"^\s*(?:поставь(?:те)?\s+задачу|новая\s+задача|задача|задание|поручаю)\b\s*[:\-—–.,]?\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 async def parse_intent(text: str) -> dict:
     text = (text or "").strip()
     if not text:
         return {"intent": "unknown", "task_text": ""}
+    m = _EXPLICIT_TASK.match(text)
+    if m and m.group(1).strip():
+        body = m.group(1).strip()
+        return {"intent": "create_task", "task_text": body[:1].upper() + body[1:]}
     if not config.LLM_API_KEY:
         return _heuristic(text)
     payload = {
