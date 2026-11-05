@@ -322,7 +322,7 @@ async def handle_command(message: Message, text: str):
     elif intent == "list_in_progress":
         await send_to(_targets(message), _fmt_group("🔧 В работе", db.list_by_status(db.STATUS_IN_PROGRESS)))
     elif intent == "list_done":
-        await send_to(_targets(message), _fmt_group("✅ Завершённые", db.list_by_status(db.STATUS_DONE)))
+        await send_to(_targets(message), _fmt_group("✅ Завершённые", db.list_by_status(db.STATUS_DONE), DONE_SHOW))
     elif intent == "list_new":
         await send_to(_targets(message), _fmt_group("🆕 Не принятые", db.list_by_status(db.STATUS_NEW)))
     elif intent == "list_all":
@@ -339,32 +339,82 @@ async def handle_command(message: Message, text: str):
             )
 
 
-def _fmt_group(title: str, tasks) -> str:
-    """Заголовок жирным + раскрывающийся список задач (можно свернуть/развернуть)."""
-    if tasks:
-        body = "\n".join(f"#{t['id']} — {esc(t['text'])}" for t in tasks)
-        return f"<b>{title} — {len(tasks)}</b>\n<blockquote expandable>{body}</blockquote>"
-    return f"<b>{title} — 0</b>\n<i>пусто</i>"
+# Telegram режет сообщения длиннее 4096 символов («message is too long»).
+MAX_MSG = 3800          # запас под разметку
+DONE_SHOW = 30          # сколько последних завершённых показывать в списке
+TASK_TEXT_MAX = 150     # в списке обрезать очень длинный текст задачи (в карточке — полный)
 
 
-def format_all_tasks() -> str:
-    """Одно сообщение: В работе / Завершённые / Не принятые — каждая секция раскрывается."""
-    return (
-        "📋 <b>Задачи</b>\n\n"
-        + _fmt_group("🔧 В работе", db.list_by_status(db.STATUS_IN_PROGRESS))
-        + "\n\n"
-        + _fmt_group("✅ Завершённые", db.list_by_status(db.STATUS_DONE))
-        + "\n\n"
-        + _fmt_group("🆕 Не принятые", db.list_by_status(db.STATUS_NEW))
+def _task_line(t: dict) -> str:
+    txt = t["text"] or ""
+    if len(txt) > TASK_TEXT_MAX:
+        txt = txt[:TASK_TEXT_MAX] + "…"
+    return f"#{t['id']} — {esc(txt)}"
+
+
+def _group_blocks(title: str, tasks, limit: int | None = None) -> list[str]:
+    """Секция: жирный заголовок + раскрывающийся список. Длинная — режется на куски."""
+    total = len(tasks)
+    hidden = 0
+    if limit is not None and total > limit:
+        hidden = total - limit
+        tasks = tasks[-limit:]          # последние (самые свежие)
+    head = f"<b>{title} — {total}</b>"
+    if not tasks:
+        return [head + "\n<i>пусто</i>"]
+    blocks, cur, cur_head = [], [], head
+    for line in (_task_line(t) for t in tasks):
+        if cur and len(cur_head) + len("\n".join(cur + [line])) + 60 > MAX_MSG:
+            blocks.append(f"{cur_head}\n<blockquote expandable>" + "\n".join(cur) + "</blockquote>")
+            cur, cur_head = [line], f"<b>{title} (продолжение)</b>"
+        else:
+            cur.append(line)
+    last = f"{cur_head}\n<blockquote expandable>" + "\n".join(cur) + "</blockquote>"
+    if hidden:
+        last += f"\n<i>…и ещё {hidden} более ранних</i>"
+    blocks.append(last)
+    return blocks
+
+
+def _pack(blocks: list[str], header: str = "") -> list[str]:
+    """Сложить блоки в сообщения, не превышая лимит Telegram."""
+    msgs, cur = [], header
+    for b in blocks:
+        sep = "\n\n" if cur else ""
+        if cur and len(cur) + len(sep) + len(b) > MAX_MSG:
+            msgs.append(cur)
+            cur = b
+        else:
+            cur = cur + sep + b
+    if cur:
+        msgs.append(cur)
+    return msgs
+
+
+def _fmt_group(title: str, tasks, limit: int | None = None) -> list[str]:
+    """Одна категория задач → список сообщений (обычно одно)."""
+    return _pack(_group_blocks(title, tasks, limit))
+
+
+def format_all_tasks() -> list[str]:
+    """В работе / Завершённые (последние DONE_SHOW) / Не принятые — раскрывающиеся секции."""
+    blocks = (
+        _group_blocks("🔧 В работе", db.list_by_status(db.STATUS_IN_PROGRESS))
+        + _group_blocks("✅ Завершённые", db.list_by_status(db.STATUS_DONE), DONE_SHOW)
+        + _group_blocks("🆕 Не принятые", db.list_by_status(db.STATUS_NEW))
     )
+    return _pack(blocks, "📋 <b>Задачи</b>")
 
 
-async def send_to(chat_ids, text: str):
+async def send_to(chat_ids, text):
+    """Отправить текст (или список сообщений) в каждый из чатов."""
+    parts = [text] if isinstance(text, str) else list(text)
     for cid in chat_ids:
-        try:
-            await bot.send_message(cid, text)
-        except Exception:
-            log.exception("send_to -> %s failed", cid)
+        for part in parts:
+            try:
+                await bot.send_message(cid, part)
+            except Exception:
+                log.exception("send_to -> %s failed", cid)
 
 
 async def delete_all_cards() -> int:
