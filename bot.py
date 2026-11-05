@@ -81,6 +81,10 @@ class RelaySession(AiohttpSession):
             prepared = self.prepare_value(value, bot=bot, files=files)
             if not prepared:
                 continue
+            # Google Apps Script портит длинные числа (chat_id/user_id > 2^31 уходят
+            # в научной записи → "chat not found"). Шлём числа строкой.
+            if isinstance(prepared, int) and not isinstance(prepared, bool):
+                prepared = str(prepared)
             params[key] = prepared
         payload = {
             "secret": config.RELAY_SECRET,
